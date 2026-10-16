@@ -3,6 +3,8 @@
 #include <ATen/native/GroupedMMUtils.h>
 #include <ATen/native/xpu/grouped_mm/grouped_mm_api.h>
 
+#include <cstdlib>
+
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
 #include <ATen/NativeFunctions.h>
@@ -11,6 +13,36 @@
 #endif
 
 namespace at::native {
+
+namespace {
+
+// The persistent SYCL-TLA kernel wins clearly when groups are small (many
+// experts with a few hundred rows each: ~2x over a loop of dense GEMMs on
+// PVC). For very large per-group problems a loop of oneDNN GEMMs is as fast
+// or slightly faster, so those stay on the fallback. Set
+// TORCH_XPU_GROUPED_MM_FORCE_SYCLTLA=1 to always take the SYCL-TLA path.
+bool prefer_sycltla_grouped_mm(
+    const Tensor& mat_a,
+    const Tensor& mat_b,
+    const Tensor& offs) {
+  static const bool force = [] {
+    const char* v = std::getenv("TORCH_XPU_GROUPED_MM_FORCE_SYCLTLA");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+  }();
+  if (force) {
+    return true;
+  }
+  constexpr int64_t kMaxAvgRowsPerGroup = 1024;
+  const int64_t groups = offs.numel();
+  // Rows that `offs` partitions: mat_a rows for 2D x 3D, the contraction
+  // dimension for 2D x 2D.
+  const int64_t rows = (mat_a.dim() == 2 && mat_b.dim() == 3)
+      ? mat_a.size(0)
+      : mat_a.size(-1);
+  return groups > 0 && rows / groups < kMaxAvgRowsPerGroup;
+}
+
+} // namespace
 
 // torch._grouped_mm on XPU.
 //
@@ -36,6 +68,7 @@ Tensor _grouped_mm_xpu(
 
   const bool use_sycltla = offs.has_value() && !bias.has_value() &&
       out_dtype_ == mat_a.scalar_type() &&
+      prefer_sycltla_grouped_mm(mat_a, mat_b, *offs) &&
       sycltla::can_use_grouped_mm(mat_a, mat_b, *offs, out);
   if (use_sycltla) {
     sycltla::grouped_mm(mat_a, mat_b, *offs, out);
